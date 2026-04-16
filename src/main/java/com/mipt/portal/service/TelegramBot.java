@@ -9,8 +9,12 @@ import com.mipt.portal.repository.UserRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
+import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageReplyMarkup;
 import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
 import java.time.Instant;
@@ -21,6 +25,8 @@ import java.util.stream.Collectors;
 @Slf4j
 @Component
 public class TelegramBot extends TelegramLongPollingBot {
+
+  private static final String CALLBACK_CONFIRM_AD = "confirm_ad:";
 
   private final TelegramBotConfig config;
   private final UserRepository userRepository;
@@ -45,6 +51,11 @@ public class TelegramBot extends TelegramLongPollingBot {
 
   @Override
   public void onUpdateReceived(Update update) {
+    if (update.hasCallbackQuery()) {
+      handleCallbackQuery(update);
+      return;
+    }
+
     if (update.hasMessage() && update.getMessage().hasText()) {
       Long chatId = update.getMessage().getChatId();
       String messageText = update.getMessage().getText();
@@ -54,21 +65,16 @@ public class TelegramBot extends TelegramLongPollingBot {
       } else if (waitingForEmail.getOrDefault(chatId, false)) {
         handleEmailInput(chatId, messageText);
       } else {
-        sendMessage(chatId, "❓ Используй команды:\n/start - начать\n/my_ads - мои объявления");
+        sendMessage(chatId, "❓ Используй команды:\n/start — начать\n/my_ads — мои объявления");
       }
     }
   }
 
   private void handleCommand(Long chatId, String command) {
     switch (command) {
-      case "/start":
-        startCommand(chatId);
-        break;
-      case "/my_ads":
-        showMyAds(chatId);
-        break;
-      default:
-        sendMessage(chatId, "❓ Неизвестная команда. Доступно: /start, /my_ads");
+      case "/start" -> startCommand(chatId);
+      case "/my_ads" -> showMyAds(chatId);
+      default -> sendMessage(chatId, "❓ Неизвестная команда. Доступно: /start, /my_ads");
     }
   }
 
@@ -133,7 +139,7 @@ public class TelegramBot extends TelegramLongPollingBot {
     } else {
       for (int i = 0; i < activeAds.size(); i++) {
         Announcement ad = activeAds.get(i);
-        response.append(i + 1).append(". *").append(ad.getTitle()).append("*\n");
+        response.append(i + 1).append(". *").append(escapeMarkdown(ad.getTitle())).append("*\n");
         response.append("   💰 ").append(ad.getPrice()).append(" ₽\n");
         response.append("   Обновлено: ").append(formatDate(ad.getUpdatedAt())).append("\n\n");
       }
@@ -145,27 +151,69 @@ public class TelegramBot extends TelegramLongPollingBot {
     } else {
       for (int i = 0; i < draftAds.size(); i++) {
         Announcement ad = draftAds.get(i);
-        response.append(i + 1).append(". *").append(ad.getTitle()).append("*\n");
+        response.append(i + 1).append(". *").append(escapeMarkdown(ad.getTitle())).append("*\n");
         response.append("   💰 ").append(ad.getPrice()).append(" ₽\n\n");
       }
     }
 
-    sendMessage(chatId, response.toString());
+    sendMarkdownMessage(chatId, response.toString());
   }
 
-  // Метод для проверки старых объявлений (вызывается из планировщика)
+  // Вызывается из планировщика — проверяет объявления, не обновлявшиеся 30 дней
   public void checkAndNotifyOldAnnouncements() {
+    archiveUnconfirmed();
+    notifyStaleAds();
+  }
+
+  // Шаг 1: архивируем объявления, по которым уведомление отправлено, но подтверждение не пришло
+  private void archiveUnconfirmed() {
+    Instant oneDayAgo = Instant.now().minus(1, ChronoUnit.DAYS);
+
+    List<Announcement> unconfirmed = announcementRepository.findByStatusAndNotifiedAtBefore(
+        AdStatus.ACTIVE, oneDayAgo);
+
+    Map<Long, List<Announcement>> adsByUser = unconfirmed.stream()
+        .collect(Collectors.groupingBy(Announcement::getAuthorId));
+
+    for (Map.Entry<Long, List<Announcement>> entry : adsByUser.entrySet()) {
+      List<Announcement> ads = entry.getValue();
+
+      for (Announcement ad : ads) {
+        ad.setStatus(AdStatus.ARCHIVED);
+        ad.setNotifiedAt(null);
+        announcementRepository.save(ad);
+        log.info("Объявление id={} переведено в архив (не подтверждено)", ad.getId());
+      }
+
+      userRepository.findById(entry.getKey()).ifPresent(user -> {
+        if (user.getTelegramChatId() != null) {
+          sendArchivedNotification(user.getTelegramChatId(), ads);
+        }
+      });
+    }
+  }
+
+  // Шаг 2: отправляем уведомления по объявлениям, которые не обновлялись 30 дней и ещё не уведомлены
+  private void notifyStaleAds() {
     Instant thirtyDaysAgo = Instant.now().minus(30, ChronoUnit.DAYS);
 
-    List<Announcement> oldActiveAds = announcementRepository.findByStatusAndUpdatedAtBefore(
-        AdStatus.ACTIVE, thirtyDaysAgo);
+    List<Announcement> staleAds = announcementRepository.findByStatusAndUpdatedAtBefore(
+        AdStatus.ACTIVE, thirtyDaysAgo).stream()
+        .filter(ad -> ad.getNotifiedAt() == null)
+        .collect(Collectors.toList());
 
-    Map<Long, List<Announcement>> adsByUser = oldActiveAds.stream()
+    Map<Long, List<Announcement>> adsByUser = staleAds.stream()
         .collect(Collectors.groupingBy(Announcement::getAuthorId));
 
     for (Map.Entry<Long, List<Announcement>> entry : adsByUser.entrySet()) {
       Long userId = entry.getKey();
       List<Announcement> userAds = entry.getValue();
+
+      // Проставляем время уведомления
+      for (Announcement ad : userAds) {
+        ad.setNotifiedAt(Instant.now());
+        announcementRepository.save(ad);
+      }
 
       userRepository.findById(userId).ifPresent(user -> {
         if (user.getTelegramChatId() != null) {
@@ -175,26 +223,130 @@ public class TelegramBot extends TelegramLongPollingBot {
     }
   }
 
-  private void sendRenewalRequest(Long chatId, List<Announcement> ads) {
-    StringBuilder message = new StringBuilder("⚠️ *Объявления требуют подтверждения!*\n\n");
-    message.append("Эти объявления не обновлялись более 30 дней:\n\n");
+  private void sendArchivedNotification(Long chatId, List<Announcement> ads) {
+    StringBuilder text = new StringBuilder("📦 Объявления переведены в архив:\n\n");
+    for (Announcement ad : ads) {
+      text.append("• ").append(ad.getTitle()).append(" — ").append(ad.getPrice()).append(" ₽\n");
+    }
+    text.append("\nЕсли хочешь восстановить — сделай это на портале.");
+    sendMessage(chatId, text.toString());
+  }
 
-    for (int i = 0; i < Math.min(ads.size(), 5); i++) {
-      Announcement ad = ads.get(i);
-      message.append(i + 1).append(". ").append(ad.getTitle())
-          .append(" - ").append(ad.getPrice()).append(" ₽\n");
+  private void sendRenewalRequest(Long chatId, List<Announcement> ads) {
+    for (Announcement ad : ads) {
+      sendSingleRenewalNotification(chatId, ad);
+    }
+  }
+
+  private void sendSingleRenewalNotification(Long chatId, Announcement ad) {
+    String text = "⚠️ *Объявление уходит в архив\\!*\n\n" +
+        escapeMarkdownV2(ad.getTitle()) + "\n" +
+        "💰 " + ad.getPrice() + " ₽\n" +
+        "🕐 Не обновлялось более 30 дней\n\n" +
+        "Подтверди, что оно ещё актуально, иначе уйдёт в архив\\.";
+
+    InlineKeyboardButton button = InlineKeyboardButton.builder()
+        .text("✅ Всё ещё актуально")
+        .callbackData(CALLBACK_CONFIRM_AD + ad.getId())
+        .build();
+
+    InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
+        .keyboard(List.of(List.of(button)))
+        .build();
+
+    SendMessage message = SendMessage.builder()
+        .chatId(chatId.toString())
+        .text(text)
+        .parseMode("MarkdownV2")
+        .replyMarkup(keyboard)
+        .build();
+
+    try {
+      execute(message);
+    } catch (TelegramApiException e) {
+      log.error("Ошибка отправки уведомления для объявления id={} chatId={}", ad.getId(), chatId, e);
+    }
+  }
+
+  private void handleCallbackQuery(Update update) {
+    String callbackId = update.getCallbackQuery().getId();
+    String data = update.getCallbackQuery().getData();
+    Long chatId = update.getCallbackQuery().getMessage().getChatId();
+    Integer messageId = update.getCallbackQuery().getMessage().getMessageId();
+
+    if (data != null && data.startsWith(CALLBACK_CONFIRM_AD)) {
+      String adIdStr = data.substring(CALLBACK_CONFIRM_AD.length());
+      handleConfirmAd(callbackId, chatId, messageId, adIdStr);
+    }
+  }
+
+  private void handleConfirmAd(String callbackId, Long chatId, Integer messageId, String adIdStr) {
+    long adId;
+    try {
+      adId = Long.parseLong(adIdStr);
+    } catch (NumberFormatException e) {
+      answerCallback(callbackId, "Ошибка: некорректный ID объявления");
+      return;
     }
 
-    message.append("\nЧтобы подтвердить актуальность, обнови объявление на портале.");
+    Optional<Announcement> adOpt = announcementRepository.findById(adId);
+    if (adOpt.isEmpty()) {
+      answerCallback(callbackId, "Объявление не найдено");
+      return;
+    }
 
-    sendMessage(chatId, message.toString());
+    Announcement ad = adOpt.get();
+
+    // Убедимся, что кнопку нажал именно владелец объявления
+    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
+    if (userOpt.isEmpty() || !userOpt.get().getId().equals(ad.getAuthorId())) {
+      answerCallback(callbackId, "Нет доступа к этому объявлению");
+      return;
+    }
+
+    ad.setUpdatedAt(Instant.now());
+    ad.setNotifiedAt(null);
+    announcementRepository.save(ad);
+
+    // Убираем кнопку из сообщения, чтобы не подтверждали дважды
+    removeButtonFromMessage(chatId, messageId, adId);
+
+    answerCallback(callbackId, "✅ Объявление «" + truncate(ad.getTitle(), 40) + "» подтверждено!");
+    log.info("Объявление id={} подтверждено пользователем chatId={}", adId, chatId);
+  }
+
+  private void answerCallback(String callbackId, String text) {
+    AnswerCallbackQuery answer = AnswerCallbackQuery.builder()
+        .callbackQueryId(callbackId)
+        .text(text)
+        .showAlert(false)
+        .build();
+    try {
+      execute(answer);
+    } catch (TelegramApiException e) {
+      log.error("Ошибка ответа на callback: {}", callbackId, e);
+    }
+  }
+
+  // Убирает все кнопки из сообщения после подтверждения
+  private void removeButtonFromMessage(Long chatId, Integer messageId, Long confirmedAdId) {
+    try {
+      EditMessageReplyMarkup edit = EditMessageReplyMarkup.builder()
+          .chatId(chatId.toString())
+          .messageId(messageId)
+          .replyMarkup(InlineKeyboardMarkup.builder().keyboard(Collections.emptyList()).build())
+          .build();
+      execute(edit);
+    } catch (TelegramApiException e) {
+      log.warn("Не удалось обновить клавиатуру сообщения id={}: {}", confirmedAdId, e.getMessage());
+    }
   }
 
   private void sendMessage(Long chatId, String text) {
-    SendMessage message = new SendMessage();
-    message.setChatId(chatId.toString());
-    message.setText(text);
-
+    SendMessage message = SendMessage.builder()
+        .chatId(chatId.toString())
+        .text(text)
+        .build();
     try {
       execute(message);
     } catch (TelegramApiException e) {
@@ -202,9 +354,39 @@ public class TelegramBot extends TelegramLongPollingBot {
     }
   }
 
+  private void sendMarkdownMessage(Long chatId, String text) {
+    SendMessage message = SendMessage.builder()
+        .chatId(chatId.toString())
+        .text(text)
+        .parseMode("Markdown")
+        .build();
+    try {
+      execute(message);
+    } catch (TelegramApiException e) {
+      log.error("Ошибка отправки markdown-сообщения chatId: {}", chatId, e);
+    }
+  }
+
   private String formatDate(Instant instant) {
     if (instant == null) return "неизвестно";
     return java.time.format.DateTimeFormatter.ofPattern("dd.MM.yyyy")
         .format(java.time.LocalDateTime.ofInstant(instant, java.time.ZoneId.systemDefault()));
+  }
+
+  // Экранирование для Markdown v1
+  private String escapeMarkdown(String text) {
+    if (text == null) return "";
+    return text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`");
+  }
+
+  // Экранирование для MarkdownV2
+  private String escapeMarkdownV2(String text) {
+    if (text == null) return "";
+    return text.replaceAll("([_*\\[\\]()~`>#+\\-=|{}.!\\\\])", "\\\\$1");
+  }
+
+  private String truncate(String text, int maxLen) {
+    if (text == null) return "";
+    return text.length() <= maxLen ? text : text.substring(0, maxLen - 1) + "…";
   }
 }
