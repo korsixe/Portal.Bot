@@ -20,4 +20,9 @@ public class TelegramBotScheduler {
     log.info("🔍 Проверка объявлений старше 30 дней...");
     telegramBot.checkAndNotifyOldAnnouncements();
   }
+
+  @Scheduled(fixedDelay = 30_000)
+  public void checkNewBookings() {
+    telegramBot.notifyNewBookings();
+  }
 }

@@ -2,9 +2,11 @@ package com.mipt.portal.service;
 
 import com.mipt.portal.config.TelegramBotConfig;
 import com.mipt.portal.entity.Announcement;
+import com.mipt.portal.entity.Booking;
 import com.mipt.portal.entity.User;
 import com.mipt.portal.enums.AdStatus;
 import com.mipt.portal.repository.AnnouncementRepository;
+import com.mipt.portal.repository.BookingRepository;
 import com.mipt.portal.repository.UserRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -31,17 +33,20 @@ public class TelegramBot extends TelegramLongPollingBot {
   private final TelegramBotConfig config;
   private final UserRepository userRepository;
   private final AnnouncementRepository announcementRepository;
+  private final BookingRepository bookingRepository;
 
   // Храним пользователей, которые ожидают ввода почты
   private final Map<Long, Boolean> waitingForEmail = new HashMap<>();
 
   public TelegramBot(TelegramBotConfig config,
       UserRepository userRepository,
-      AnnouncementRepository announcementRepository) {
+      AnnouncementRepository announcementRepository,
+      BookingRepository bookingRepository) {
     super(config.getToken());
     this.config = config;
     this.userRepository = userRepository;
     this.announcementRepository = announcementRepository;
+    this.bookingRepository = bookingRepository;
   }
 
   @Override
@@ -157,6 +162,32 @@ public class TelegramBot extends TelegramLongPollingBot {
     }
 
     sendMarkdownMessage(chatId, response.toString());
+  }
+
+  // Вызывается из планировщика — уведомляет о новых бронированиях
+  public void notifyNewBookings() {
+    List<Booking> pending = bookingRepository.findByNotificationSentAtIsNull();
+    for (Booking booking : pending) {
+      announcementRepository.findById(booking.getAnnouncementId()).ifPresent(ad -> {
+        userRepository.findById(ad.getAuthorId()).ifPresent(seller -> {
+          if (seller.getTelegramChatId() != null) {
+            sendMessage(seller.getTelegramChatId(),
+                "Твой товар «" + ad.getTitle() + "» забронирован на 24 часа!\n" +
+                "Покупатель свяжется с тобой для выкупа.");
+          }
+        });
+        userRepository.findById(booking.getBuyerId()).ifPresent(buyer -> {
+          if (buyer.getTelegramChatId() != null) {
+            sendMessage(buyer.getTelegramChatId(),
+                "Ты забронировал «" + ad.getTitle() + "» за " + ad.getPrice() + " ₽.\n" +
+                "У тебя есть 24 часа для выкупа — свяжись с продавцом!");
+          }
+        });
+      });
+      booking.setNotificationSentAt(Instant.now());
+      bookingRepository.save(booking);
+      log.info("Уведомление о бронировании отправлено для bookingId={}", booking.getId());
+    }
   }
 
   // Вызывается из планировщика — проверяет объявления, не обновлявшиеся 30 дней
