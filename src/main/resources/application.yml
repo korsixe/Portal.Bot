@@ -1,0 +1,16 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5433/myproject
+    username: myuser
+    password: ${DB_PASSWORD:mypassword}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+
+telegram:
+  bot:
+    name: "PhystechPortalBot"
+    token: "8441149825:AAHWjnuLsOk2AZhctVFrppMgJvPWLD3J65I"
