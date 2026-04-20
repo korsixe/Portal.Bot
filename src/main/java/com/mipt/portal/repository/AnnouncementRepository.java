@@ -7,6 +7,7 @@ import jakarta.persistence.LockModeType;
 import java.time.Instant;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
@@ -33,6 +34,10 @@ public interface AnnouncementRepository extends JpaRepository<Announcement, Long
     List<Announcement> findByAuthorId(Long authorId);
 
     List<Announcement> findByStatusAndUpdatedAtBefore(AdStatus status, Instant date);
+
+    @Modifying
+    @Query("UPDATE Announcement a SET a.viewCount = a.viewCount + 1 WHERE a.id = :id")
+    int incrementViews(@Param("id") Long id);
 
     // Объявления, уведомление по которым было отправлено до указанной даты (не подтверждены)
     List<Announcement> findByStatusAndNotifiedAtBefore(AdStatus status, Instant date);

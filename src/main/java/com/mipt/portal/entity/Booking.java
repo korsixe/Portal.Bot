@@ -25,4 +25,16 @@ public class Booking {
 
     @Column(name = "notification_sent_at")
     private Instant notificationSentAt;
+
+    @Column(name = "cancelled_at")
+    private Instant cancelledAt;
+
+    @Column(name = "cancel_notification_sent_at")
+    private Instant cancelNotificationSentAt;
+
+    @Column(name = "confirmed_at")
+    private Instant confirmedAt;
+
+    @Column(name = "confirm_notification_sent_at")
+    private Instant confirmNotificationSentAt;
 }

@@ -35,8 +35,8 @@ public class TelegramBot extends TelegramLongPollingBot {
   private final AnnouncementRepository announcementRepository;
   private final BookingRepository bookingRepository;
 
-  // Храним пользователей, которые ожидают ввода почты
   private final Map<Long, Boolean> waitingForEmail = new HashMap<>();
+  private final Map<Long, String> pendingTgUsername = new HashMap<>();
 
   public TelegramBot(TelegramBotConfig config,
       UserRepository userRepository,
@@ -64,9 +64,10 @@ public class TelegramBot extends TelegramLongPollingBot {
     if (update.hasMessage() && update.getMessage().hasText()) {
       Long chatId = update.getMessage().getChatId();
       String messageText = update.getMessage().getText();
+      String tgUsername = update.getMessage().getFrom().getUserName();
 
       if (messageText.startsWith("/")) {
-        handleCommand(chatId, messageText);
+        handleCommand(chatId, messageText, tgUsername);
       } else if (waitingForEmail.getOrDefault(chatId, false)) {
         handleEmailInput(chatId, messageText);
       } else {
@@ -75,21 +76,28 @@ public class TelegramBot extends TelegramLongPollingBot {
     }
   }
 
-  private void handleCommand(Long chatId, String command) {
+  private void handleCommand(Long chatId, String command, String tgUsername) {
     switch (command) {
-      case "/start" -> startCommand(chatId);
+      case "/start" -> startCommand(chatId, tgUsername);
       case "/my_ads" -> showMyAds(chatId);
       default -> sendMessage(chatId, "❓ Неизвестная команда. Доступно: /start, /my_ads");
     }
   }
 
-  private void startCommand(Long chatId) {
+  private void startCommand(Long chatId, String tgUsername) {
     Optional<User> existingUser = userRepository.findByTelegramChatId(chatId);
 
     if (existingUser.isPresent()) {
       User user = existingUser.get();
+      if (tgUsername != null && !tgUsername.equals(user.getTelegramUsername())) {
+        user.setTelegramUsername(tgUsername);
+        userRepository.save(user);
+      }
       sendMessage(chatId, "С возвращением, " + user.getName() + "!\nИспользуй /my_ads для просмотра объявлений.");
     } else {
+      if (tgUsername != null) {
+        pendingTgUsername.put(chatId, tgUsername);
+      }
       sendMessage(chatId, "Привет! Введи свою корпоративную почту Физтеха (@phystech.edu):");
       waitingForEmail.put(chatId, true);
     }
@@ -106,11 +114,16 @@ public class TelegramBot extends TelegramLongPollingBot {
     if (userOpt.isEmpty()) {
       sendMessage(chatId, "Пользователь с почтой " + email + " не найден.\nСначала зарегистрируйся на портале.");
       waitingForEmail.remove(chatId);
+      pendingTgUsername.remove(chatId);
       return;
     }
 
     User user = userOpt.get();
     user.setTelegramChatId(chatId);
+    String tgUsername = pendingTgUsername.remove(chatId);
+    if (tgUsername != null) {
+      user.setTelegramUsername(tgUsername);
+    }
     userRepository.save(user);
 
     waitingForEmail.remove(chatId);
@@ -169,24 +182,101 @@ public class TelegramBot extends TelegramLongPollingBot {
     List<Booking> pending = bookingRepository.findByNotificationSentAtIsNull();
     for (Booking booking : pending) {
       announcementRepository.findById(booking.getAnnouncementId()).ifPresent(ad -> {
-        userRepository.findById(ad.getAuthorId()).ifPresent(seller -> {
+        Optional<User> sellerOpt = userRepository.findById(ad.getAuthorId());
+        Optional<User> buyerOpt = userRepository.findById(booking.getBuyerId());
+
+        String sellerContact = sellerOpt.map(this::getTelegramContact).orElse("продавец");
+        String buyerContact = buyerOpt.map(this::getTelegramContact).orElse("покупатель");
+
+        sellerOpt.ifPresent(seller -> {
           if (seller.getTelegramChatId() != null) {
             sendMessage(seller.getTelegramChatId(),
-                "Твой товар «" + ad.getTitle() + "» забронирован на 24 часа!\n" +
-                "Покупатель свяжется с тобой для выкупа.");
+                "🔒 Твой товар «" + ad.getTitle() + "» забронирован на 24 часа!\n" +
+                "Покупатель: " + buyerContact + "\n" +
+                "Свяжитесь для организации передачи.");
           }
         });
-        userRepository.findById(booking.getBuyerId()).ifPresent(buyer -> {
+
+        buyerOpt.ifPresent(buyer -> {
           if (buyer.getTelegramChatId() != null) {
             sendMessage(buyer.getTelegramChatId(),
-                "Ты забронировал «" + ad.getTitle() + "» за " + ad.getPrice() + " ₽.\n" +
-                "У тебя есть 24 часа для выкупа — свяжись с продавцом!");
+                "🔒 Ты забронировал «" + ad.getTitle() + "» за " + ad.getPrice() + " ₽ на 24 часа.\n" +
+                "Продавец: " + sellerContact + "\n" +
+                "Свяжись с продавцом для организации передачи.");
           }
         });
       });
       booking.setNotificationSentAt(Instant.now());
       bookingRepository.save(booking);
       log.info("Уведомление о бронировании отправлено для bookingId={}", booking.getId());
+    }
+  }
+
+  // Вызывается из планировщика — уведомляет об отменённых бронированиях
+  public void notifyCancelledBookings() {
+    List<Booking> cancelled = bookingRepository.findByCancelledAtIsNotNullAndCancelNotificationSentAtIsNull();
+    for (Booking booking : cancelled) {
+      Optional<Announcement> adOpt = announcementRepository.findById(booking.getAnnouncementId());
+      Optional<User> sellerOpt = adOpt.flatMap(ad -> userRepository.findById(ad.getAuthorId()));
+      Optional<User> buyerOpt = userRepository.findById(booking.getBuyerId());
+
+      String adTitle = adOpt.map(Announcement::getTitle).orElse("товар");
+      String sellerContact = sellerOpt.map(this::getTelegramContact).orElse("продавец");
+      String buyerContact = buyerOpt.map(this::getTelegramContact).orElse("покупатель");
+
+      sellerOpt.ifPresent(seller -> {
+        if (seller.getTelegramChatId() != null) {
+          sendMessage(seller.getTelegramChatId(),
+              "❌ Бронь на твой товар «" + adTitle + "» отменена.\n" +
+              "Покупатель: " + buyerContact + "\n" +
+              "Товар снова доступен для покупки.");
+        }
+      });
+
+      buyerOpt.ifPresent(buyer -> {
+        if (buyer.getTelegramChatId() != null) {
+          sendMessage(buyer.getTelegramChatId(),
+              "❌ Твоя бронь на «" + adTitle + "» отменена.\n" +
+              "Продавец: " + sellerContact);
+        }
+      });
+
+      booking.setCancelNotificationSentAt(Instant.now());
+      bookingRepository.save(booking);
+      log.info("Уведомление об отмене брони отправлено для bookingId={}", booking.getId());
+    }
+  }
+
+  // Вызывается из планировщика — уведомляет о подтверждённых покупках
+  public void notifyConfirmedBookings() {
+    List<Booking> confirmed = bookingRepository.findByConfirmedAtIsNotNullAndConfirmNotificationSentAtIsNull();
+    for (Booking booking : confirmed) {
+      announcementRepository.findById(booking.getAnnouncementId()).ifPresent(ad -> {
+        Optional<User> sellerOpt = userRepository.findById(ad.getAuthorId());
+        Optional<User> buyerOpt = userRepository.findById(booking.getBuyerId());
+
+        String sellerContact = sellerOpt.map(this::getTelegramContact).orElse("продавец");
+        String buyerContact = buyerOpt.map(this::getTelegramContact).orElse("покупатель");
+
+        sellerOpt.ifPresent(seller -> {
+          if (seller.getTelegramChatId() != null) {
+            sendMessage(seller.getTelegramChatId(),
+                "🎉 Продажа «" + ad.getTitle() + "» за " + ad.getPrice() + " ₽ подтверждена!\n" +
+                "Покупатель: " + buyerContact);
+          }
+        });
+
+        buyerOpt.ifPresent(buyer -> {
+          if (buyer.getTelegramChatId() != null) {
+            sendMessage(buyer.getTelegramChatId(),
+                "🎉 Покупка «" + ad.getTitle() + "» за " + ad.getPrice() + " ₽ подтверждена!\n" +
+                "Продавец: " + sellerContact);
+          }
+        });
+      });
+      booking.setConfirmNotificationSentAt(Instant.now());
+      bookingRepository.save(booking);
+      log.info("Уведомление о подтверждении покупки отправлено для bookingId={}", booking.getId());
     }
   }
 
@@ -240,7 +330,6 @@ public class TelegramBot extends TelegramLongPollingBot {
       Long userId = entry.getKey();
       List<Announcement> userAds = entry.getValue();
 
-      // Проставляем время уведомления
       for (Announcement ad : userAds) {
         ad.setNotifiedAt(Instant.now());
         announcementRepository.save(ad);
@@ -328,7 +417,6 @@ public class TelegramBot extends TelegramLongPollingBot {
 
     Announcement ad = adOpt.get();
 
-    // Убедимся, что кнопку нажал именно владелец объявления
     Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
     if (userOpt.isEmpty() || !userOpt.get().getId().equals(ad.getAuthorId())) {
       answerCallback(callbackId, "Нет доступа к этому объявлению");
@@ -339,7 +427,6 @@ public class TelegramBot extends TelegramLongPollingBot {
     ad.setNotifiedAt(null);
     announcementRepository.save(ad);
 
-    // Убираем кнопку из сообщения, чтобы не подтверждали дважды
     removeButtonFromMessage(chatId, messageId, adId);
 
     answerCallback(callbackId, "✅ Объявление «" + truncate(ad.getTitle(), 40) + "» подтверждено!");
@@ -359,7 +446,6 @@ public class TelegramBot extends TelegramLongPollingBot {
     }
   }
 
-  // Убирает все кнопки из сообщения после подтверждения
   private void removeButtonFromMessage(Long chatId, Integer messageId, Long confirmedAdId) {
     try {
       EditMessageReplyMarkup edit = EditMessageReplyMarkup.builder()
@@ -371,6 +457,13 @@ public class TelegramBot extends TelegramLongPollingBot {
     } catch (TelegramApiException e) {
       log.warn("Не удалось обновить клавиатуру сообщения id={}: {}", confirmedAdId, e.getMessage());
     }
+  }
+
+  private String getTelegramContact(User user) {
+    if (user.getTelegramUsername() != null && !user.getTelegramUsername().isBlank()) {
+      return "@" + user.getTelegramUsername();
+    }
+    return user.getName();
   }
 
   private void sendMessage(Long chatId, String text) {
@@ -404,13 +497,11 @@ public class TelegramBot extends TelegramLongPollingBot {
         .format(java.time.LocalDateTime.ofInstant(instant, java.time.ZoneId.systemDefault()));
   }
 
-  // Экранирование для Markdown v1
   private String escapeMarkdown(String text) {
     if (text == null) return "";
     return text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`");
   }
 
-  // Экранирование для MarkdownV2
   private String escapeMarkdownV2(String text) {
     if (text == null) return "";
     return text.replaceAll("([_*\\[\\]()~`>#+\\-=|{}.!\\\\])", "\\\\$1");

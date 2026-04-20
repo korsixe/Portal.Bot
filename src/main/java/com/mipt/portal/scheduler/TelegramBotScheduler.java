@@ -17,12 +17,14 @@ public class TelegramBotScheduler {
 
   @Scheduled(cron = "0 0 23 * * *")
   public void checkOldAnnouncements() {
-    log.info("🔍 Проверка объявлений старше 30 дней...");
+    log.info("Проверка объявлений старше 30 дней...");
     telegramBot.checkAndNotifyOldAnnouncements();
   }
 
-  @Scheduled(fixedDelay = 30_000)
-  public void checkNewBookings() {
+  @Scheduled(fixedDelay = 60_000)
+  public void checkBookingEvents() {
     telegramBot.notifyNewBookings();
+    telegramBot.notifyCancelledBookings();
+    telegramBot.notifyConfirmedBookings();
   }
 }
