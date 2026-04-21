@@ -460,10 +460,16 @@ public class TelegramBot extends TelegramLongPollingBot {
   }
 
   private String getTelegramContact(User user) {
+    StringBuilder contact = new StringBuilder();
     if (user.getTelegramUsername() != null && !user.getTelegramUsername().isBlank()) {
-      return "@" + user.getTelegramUsername();
+      contact.append("@").append(user.getTelegramUsername());
+    } else {
+      contact.append(user.getName());
     }
-    return user.getName();
+    if (user.getEmail() != null && !user.getEmail().isBlank()) {
+      contact.append(" (").append(user.getEmail()).append(")");
+    }
+    return contact.toString();
   }
 
   private void sendMessage(Long chatId, String text) {
