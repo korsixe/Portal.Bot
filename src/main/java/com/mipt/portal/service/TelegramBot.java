@@ -1,6 +1,7 @@
 package com.mipt.portal.service;
 
 import com.mipt.portal.config.TelegramBotConfig;
+import com.mipt.portal.dto.AnnouncementFilterDto;
 import com.mipt.portal.entity.Announcement;
 import com.mipt.portal.entity.Booking;
 import com.mipt.portal.entity.User;
@@ -10,6 +11,7 @@ import com.mipt.portal.repository.BookingRepository;
 import com.mipt.portal.repository.UserRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+import org.telegram.telegrambots.bots.DefaultBotOptions;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
@@ -29,6 +31,8 @@ import java.util.stream.Collectors;
 public class TelegramBot extends TelegramLongPollingBot {
 
   private static final String CALLBACK_CONFIRM_AD = "confirm_ad:";
+  private static final String CALLBACK_UNLINK_CONFIRM = "unlink_confirm";
+  private static final String CALLBACK_UNLINK_CANCEL = "unlink_cancel";
 
   private final TelegramBotConfig config;
   private final UserRepository userRepository;
@@ -37,12 +41,14 @@ public class TelegramBot extends TelegramLongPollingBot {
 
   private final Map<Long, Boolean> waitingForEmail = new HashMap<>();
   private final Map<Long, String> pendingTgUsername = new HashMap<>();
+  private final Map<Long, Boolean> waitingForSearch = new HashMap<>();
 
   public TelegramBot(TelegramBotConfig config,
+      DefaultBotOptions options,
       UserRepository userRepository,
       AnnouncementRepository announcementRepository,
       BookingRepository bookingRepository) {
-    super(config.getToken());
+    super(options, config.getToken());
     this.config = config;
     this.userRepository = userRepository;
     this.announcementRepository = announcementRepository;
@@ -70,17 +76,34 @@ public class TelegramBot extends TelegramLongPollingBot {
         handleCommand(chatId, messageText, tgUsername);
       } else if (waitingForEmail.getOrDefault(chatId, false)) {
         handleEmailInput(chatId, messageText);
+      } else if (waitingForSearch.getOrDefault(chatId, false)) {
+        waitingForSearch.remove(chatId);
+        performSearch(chatId, messageText);
       } else {
-        sendMessage(chatId, "❓ Используй команды:\n/start — начать\n/my_ads — мои объявления");
+        sendMessage(chatId, "❓ Используй команды:\n/start — начать\n/my_ads — мои объявления\n/bookings — мои бронирования\n/search — поиск объявлений\n/unlink — отвязать аккаунт");
       }
     }
   }
 
   private void handleCommand(Long chatId, String command, String tgUsername) {
-    switch (command) {
-      case "/start" -> startCommand(chatId, tgUsername);
-      case "/my_ads" -> showMyAds(chatId);
-      default -> sendMessage(chatId, "❓ Неизвестная команда. Доступно: /start, /my_ads");
+    if (command.equals("/start")) {
+      startCommand(chatId, tgUsername);
+    } else if (command.equals("/my_ads")) {
+      showMyAds(chatId);
+    } else if (command.equals("/bookings")) {
+      showMyBookings(chatId);
+    } else if (command.equals("/unlink")) {
+      unlinkCommand(chatId);
+    } else if (command.startsWith("/search")) {
+      String query = command.length() > 7 ? command.substring(7).trim() : "";
+      if (query.isEmpty()) {
+        waitingForSearch.put(chatId, true);
+        sendMessage(chatId, "Введи поисковый запрос:");
+      } else {
+        performSearch(chatId, query);
+      }
+    } else {
+      sendMessage(chatId, "❓ Неизвестная команда. Доступно: /start, /my_ads, /bookings, /search, /unlink");
     }
   }
 
@@ -145,6 +168,10 @@ public class TelegramBot extends TelegramLongPollingBot {
         .filter(ad -> ad.getStatus() == AdStatus.ACTIVE)
         .collect(Collectors.toList());
 
+    List<Announcement> moderationAds = userAds.stream()
+        .filter(ad -> ad.getStatus() == AdStatus.UNDER_MODERATION)
+        .collect(Collectors.toList());
+
     List<Announcement> draftAds = userAds.stream()
         .filter(ad -> ad.getStatus() == AdStatus.DRAFT)
         .collect(Collectors.toList());
@@ -163,7 +190,18 @@ public class TelegramBot extends TelegramLongPollingBot {
       }
     }
 
-    response.append("📝 *Черновики:*\n");
+    response.append("⏳ *На модерации:*\n");
+    if (moderationAds.isEmpty()) {
+      response.append("Нет объявлений на модерации\n");
+    } else {
+      for (int i = 0; i < moderationAds.size(); i++) {
+        Announcement ad = moderationAds.get(i);
+        response.append(i + 1).append(". *").append(escapeMarkdown(ad.getTitle())).append("*\n");
+        response.append("   💰 ").append(ad.getPrice()).append(" ₽\n\n");
+      }
+    }
+
+    response.append("\n📝 *Черновики:*\n");
     if (draftAds.isEmpty()) {
       response.append("Нет черновиков\n");
     } else {
@@ -172,6 +210,133 @@ public class TelegramBot extends TelegramLongPollingBot {
         response.append(i + 1).append(". *").append(escapeMarkdown(ad.getTitle())).append("*\n");
         response.append("   💰 ").append(ad.getPrice()).append(" ₽\n\n");
       }
+    }
+
+    sendMarkdownMessage(chatId, response.toString());
+  }
+
+  private void showMyBookings(Long chatId) {
+    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
+
+    if (userOpt.isEmpty()) {
+      sendMessage(chatId, "Аккаунт не привязан. Используй /start");
+      return;
+    }
+
+    User user = userOpt.get();
+    List<Booking> allBookings = bookingRepository.findAllByBuyerId(user.getId());
+
+    List<Booking> active = allBookings.stream()
+        .filter(b -> b.getCancelledAt() == null && b.getConfirmedAt() == null)
+        .collect(Collectors.toList());
+
+    if (active.isEmpty()) {
+      sendMessage(chatId, "У тебя нет активных бронирований.");
+      return;
+    }
+
+    StringBuilder response = new StringBuilder("🔒 *Мои бронирования*\n\n");
+
+    Instant now = Instant.now();
+    for (int i = 0; i < active.size(); i++) {
+      Booking booking = active.get(i);
+      Optional<Announcement> adOpt = announcementRepository.findById(booking.getAnnouncementId());
+
+      String title = adOpt.map(ad -> escapeMarkdown(ad.getTitle())).orElse("Объявление удалено");
+      String price = adOpt.map(ad -> ad.getPrice() + " ₽").orElse("—");
+
+      long elapsedMinutes = ChronoUnit.MINUTES.between(booking.getCreatedAt(), now);
+      long remainingMinutes = 24 * 60 - elapsedMinutes;
+
+      String remaining;
+      if (remainingMinutes <= 0) {
+        remaining = "истекает";
+      } else if (remainingMinutes < 60) {
+        remaining = "< " + remainingMinutes + " мин";
+      } else {
+        long hours = remainingMinutes / 60;
+        long minutes = remainingMinutes % 60;
+        remaining = hours + " ч " + (minutes > 0 ? minutes + " мин" : "");
+      }
+
+      response.append(i + 1).append(". *").append(title).append("*\n");
+      response.append("   💰 ").append(price).append("\n");
+      response.append("   ⏳ Осталось: ").append(remaining).append("\n\n");
+    }
+
+    sendMarkdownMessage(chatId, response.toString());
+  }
+
+  private void unlinkCommand(Long chatId) {
+    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
+
+    if (userOpt.isEmpty()) {
+      sendMessage(chatId, "Аккаунт не привязан. Используй /start для привязки.");
+      return;
+    }
+
+    User user = userOpt.get();
+
+    InlineKeyboardButton confirmButton = InlineKeyboardButton.builder()
+        .text("Да, отвязать")
+        .callbackData(CALLBACK_UNLINK_CONFIRM)
+        .build();
+
+    InlineKeyboardButton cancelButton = InlineKeyboardButton.builder()
+        .text("Отмена")
+        .callbackData(CALLBACK_UNLINK_CANCEL)
+        .build();
+
+    InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
+        .keyboard(List.of(List.of(confirmButton, cancelButton)))
+        .build();
+
+    SendMessage message = SendMessage.builder()
+        .chatId(chatId.toString())
+        .text("Отвязать аккаунт " + user.getEmail() + " от этого Telegram?\n\nПосле отвязки уведомления приходить не будут.")
+        .replyMarkup(keyboard)
+        .build();
+
+    try {
+      execute(message);
+    } catch (TelegramApiException e) {
+      log.error("Ошибка отправки запроса на отвязку chatId={}", chatId, e);
+    }
+  }
+
+  private void performSearch(Long chatId, String query) {
+    AnnouncementFilterDto filter = new AnnouncementFilterDto();
+    filter.setText(query);
+
+    List<Announcement> results = announcementRepository.searchApproved(filter, "createdAt", "DESC");
+
+    if (results.isEmpty()) {
+      sendMessage(chatId, "По запросу «" + query + "» ничего не найдено.");
+      return;
+    }
+
+    int shown = Math.min(results.size(), 5);
+    StringBuilder response = new StringBuilder("🔍 *Результаты: " + escapeMarkdown(query) + "*\n");
+    if (results.size() > shown) {
+      response.append("Найдено: ").append(results.size()).append(", показываю первые ").append(shown).append("\n");
+    }
+    response.append("\n");
+
+    for (int i = 0; i < shown; i++) {
+      Announcement ad = results.get(i);
+      response.append(i + 1).append(". *").append(escapeMarkdown(ad.getTitle())).append("*\n");
+      response.append("   💰 ").append(ad.getPrice()).append(" ₽");
+      if (ad.getCondition() != null) {
+        response.append(" · ").append(ad.getCondition().getDisplayName());
+      }
+      response.append("\n");
+      if (ad.getCategory() != null) {
+        response.append("   🏷 ").append(ad.getCategory().getDisplayName()).append("\n");
+      }
+      if (ad.getLocation() != null && !ad.getLocation().isBlank()) {
+        response.append("   📍 ").append(escapeMarkdown(ad.getLocation())).append("\n");
+      }
+      response.append("\n");
     }
 
     sendMarkdownMessage(chatId, response.toString());
@@ -397,6 +562,10 @@ public class TelegramBot extends TelegramLongPollingBot {
     if (data != null && data.startsWith(CALLBACK_CONFIRM_AD)) {
       String adIdStr = data.substring(CALLBACK_CONFIRM_AD.length());
       handleConfirmAd(callbackId, chatId, messageId, adIdStr);
+    } else if (CALLBACK_UNLINK_CONFIRM.equals(data)) {
+      handleUnlinkConfirm(callbackId, chatId, messageId);
+    } else if (CALLBACK_UNLINK_CANCEL.equals(data)) {
+      handleUnlinkCancel(callbackId, chatId, messageId);
     }
   }
 
@@ -433,6 +602,31 @@ public class TelegramBot extends TelegramLongPollingBot {
     log.info("Объявление id={} подтверждено пользователем chatId={}", adId, chatId);
   }
 
+  private void handleUnlinkConfirm(String callbackId, Long chatId, Integer messageId) {
+    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
+
+    if (userOpt.isEmpty()) {
+      answerCallback(callbackId, "Аккаунт уже не привязан");
+      removeButtonFromMessage(chatId, messageId, null);
+      return;
+    }
+
+    User user = userOpt.get();
+    user.setTelegramChatId(null);
+    user.setTelegramUsername(null);
+    userRepository.save(user);
+
+    removeButtonFromMessage(chatId, messageId, null);
+    answerCallback(callbackId, "Аккаунт отвязан");
+    sendMessage(chatId, "Аккаунт " + user.getEmail() + " отвязан. Используй /start для повторной привязки.");
+    log.info("Аккаунт userId={} отвязан от chatId={}", user.getId(), chatId);
+  }
+
+  private void handleUnlinkCancel(String callbackId, Long chatId, Integer messageId) {
+    removeButtonFromMessage(chatId, messageId, null);
+    answerCallback(callbackId, "Отменено");
+  }
+
   private void answerCallback(String callbackId, String text) {
     AnswerCallbackQuery answer = AnswerCallbackQuery.builder()
         .callbackQueryId(callbackId)
@@ -446,7 +640,7 @@ public class TelegramBot extends TelegramLongPollingBot {
     }
   }
 
-  private void removeButtonFromMessage(Long chatId, Integer messageId, Long confirmedAdId) {
+  private void removeButtonFromMessage(Long chatId, Integer messageId, Object context) {
     try {
       EditMessageReplyMarkup edit = EditMessageReplyMarkup.builder()
           .chatId(chatId.toString())
@@ -455,7 +649,7 @@ public class TelegramBot extends TelegramLongPollingBot {
           .build();
       execute(edit);
     } catch (TelegramApiException e) {
-      log.warn("Не удалось обновить клавиатуру сообщения id={}: {}", confirmedAdId, e.getMessage());
+      log.warn("Не удалось обновить клавиатуру сообщения context={}: {}", context, e.getMessage());
     }
   }
 
