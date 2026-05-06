@@ -10,6 +10,10 @@ spring:
       ddl-auto: update
     show-sql: true
 
+portal:
+  frontend:
+    url: "http://localhost:3000"
+
 telegram:
   bot:
     name: "PhystechPortalBot"

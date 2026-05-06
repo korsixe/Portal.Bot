@@ -10,14 +10,17 @@ import com.mipt.portal.repository.AnnouncementRepository;
 import com.mipt.portal.repository.BookingRepository;
 import com.mipt.portal.repository.UserRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.bots.DefaultBotOptions;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageReplyMarkup;
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardRemove;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
@@ -30,18 +33,27 @@ import java.util.stream.Collectors;
 @Component
 public class TelegramBot extends TelegramLongPollingBot {
 
-  private static final String CALLBACK_CONFIRM_AD = "confirm_ad:";
-  private static final String CALLBACK_UNLINK_CONFIRM = "unlink_confirm";
-  private static final String CALLBACK_UNLINK_CANCEL = "unlink_cancel";
+  // Callback data
+  private static final String CB_MENU         = "menu";
+  private static final String CB_MY_ADS       = "my_ads";
+  private static final String CB_BOOKINGS     = "bookings";
+  private static final String CB_SEARCH       = "search";
+  private static final String CB_UNLINK       = "unlink";
+  private static final String CB_UNLINK_YES   = "unlink_confirm";
+  private static final String CB_UNLINK_NO    = "unlink_cancel";
+  private static final String CB_CONFIRM_AD   = "confirm_ad:";
+
+  @Value("${portal.frontend.url}")
+  private String frontendUrl;
 
   private final TelegramBotConfig config;
   private final UserRepository userRepository;
   private final AnnouncementRepository announcementRepository;
   private final BookingRepository bookingRepository;
 
-  private final Map<Long, Boolean> waitingForEmail = new HashMap<>();
-  private final Map<Long, String> pendingTgUsername = new HashMap<>();
-  private final Map<Long, Boolean> waitingForSearch = new HashMap<>();
+  private final Map<Long, Boolean> waitingForEmail  = new HashMap<>();
+  private final Map<Long, String>  pendingTgUsername = new HashMap<>();
+  private final Map<Long, Boolean> waitingForSearch  = new HashMap<>();
 
   public TelegramBot(TelegramBotConfig config,
       DefaultBotOptions options,
@@ -60,254 +72,242 @@ public class TelegramBot extends TelegramLongPollingBot {
     return config.getName();
   }
 
+  // ─── Входящие события ────────────────────────────────────────────────────
+
   @Override
   public void onUpdateReceived(Update update) {
     if (update.hasCallbackQuery()) {
-      handleCallbackQuery(update);
+      handleCallback(update);
       return;
     }
-
     if (update.hasMessage() && update.getMessage().hasText()) {
-      Long chatId = update.getMessage().getChatId();
-      String messageText = update.getMessage().getText();
-      String tgUsername = update.getMessage().getFrom().getUserName();
+      Long   chatId  = update.getMessage().getChatId();
+      String text    = update.getMessage().getText();
+      String tgUser  = update.getMessage().getFrom().getUserName();
 
-      if (messageText.startsWith("/")) {
-        handleCommand(chatId, messageText, tgUsername);
+      if (text.equals("/start")) {
+        startCommand(chatId, tgUser);
       } else if (waitingForEmail.getOrDefault(chatId, false)) {
-        handleEmailInput(chatId, messageText);
+        handleEmailInput(chatId, text);
       } else if (waitingForSearch.getOrDefault(chatId, false)) {
         waitingForSearch.remove(chatId);
-        performSearch(chatId, messageText);
+        performSearch(chatId, text);
       } else {
-        sendMessage(chatId, "❓ Используй команды:\n/start — начать\n/my_ads — мои объявления\n/bookings — мои бронирования\n/search — поиск объявлений\n/unlink — отвязать аккаунт");
+        sendMessage(chatId, "Используй /start или кнопки меню.");
       }
     }
   }
 
-  private void handleCommand(Long chatId, String command, String tgUsername) {
-    if (command.equals("/start")) {
-      startCommand(chatId, tgUsername);
-    } else if (command.equals("/my_ads")) {
-      showMyAds(chatId);
-    } else if (command.equals("/bookings")) {
-      showMyBookings(chatId);
-    } else if (command.equals("/unlink")) {
-      unlinkCommand(chatId);
-    } else if (command.startsWith("/search")) {
-      String query = command.length() > 7 ? command.substring(7).trim() : "";
-      if (query.isEmpty()) {
-        waitingForSearch.put(chatId, true);
-        sendMessage(chatId, "Введи поисковый запрос:");
-      } else {
-        performSearch(chatId, query);
-      }
-    } else {
-      sendMessage(chatId, "❓ Неизвестная команда. Доступно: /start, /my_ads, /bookings, /search, /unlink");
-    }
-  }
+  // ─── /start ───────────────────────────────────────────────────────────────
 
   private void startCommand(Long chatId, String tgUsername) {
-    Optional<User> existingUser = userRepository.findByTelegramChatId(chatId);
+    Optional<User> existing = userRepository.findByTelegramChatId(chatId);
 
-    if (existingUser.isPresent()) {
-      User user = existingUser.get();
+    if (existing.isPresent()) {
+      User user = existing.get();
       if (tgUsername != null && !tgUsername.equals(user.getTelegramUsername())) {
         user.setTelegramUsername(tgUsername);
         userRepository.save(user);
       }
-      sendMessage(chatId, "С возвращением, " + user.getName() + "!\nИспользуй /my_ads для просмотра объявлений.");
+      sendMainMenu(chatId, "С возвращением, " + user.getName() + "!");
     } else {
-      if (tgUsername != null) {
-        pendingTgUsername.put(chatId, tgUsername);
-      }
-      sendMessage(chatId, "Привет! Введи свою корпоративную почту Физтеха (@phystech.edu):");
+      if (tgUsername != null) pendingTgUsername.put(chatId, tgUsername);
+      sendMessage(chatId, "Привет! Введи корпоративную почту Физтеха (@phystech.edu):");
       waitingForEmail.put(chatId, true);
     }
   }
+
+  // ─── Привязка email ───────────────────────────────────────────────────────
 
   private void handleEmailInput(Long chatId, String email) {
     if (!email.endsWith("@phystech.edu")) {
       sendMessage(chatId, "Нужна почта @phystech.edu. Попробуй ещё раз:");
       return;
     }
-
     Optional<User> userOpt = userRepository.findByEmail(email);
-
     if (userOpt.isEmpty()) {
-      sendMessage(chatId, "Пользователь с почтой " + email + " не найден.\nСначала зарегистрируйся на портале.");
+      sendMessage(chatId, "Пользователь " + email + " не найден. Сначала зарегистрируйся на портале.");
       waitingForEmail.remove(chatId);
       pendingTgUsername.remove(chatId);
       return;
     }
-
     User user = userOpt.get();
     user.setTelegramChatId(chatId);
     String tgUsername = pendingTgUsername.remove(chatId);
-    if (tgUsername != null) {
-      user.setTelegramUsername(tgUsername);
-    }
+    if (tgUsername != null) user.setTelegramUsername(tgUsername);
     userRepository.save(user);
-
     waitingForEmail.remove(chatId);
-    sendMessage(chatId, "Привязка успешна! Привет, " + user.getName() + "!\nИспользуй /my_ads");
+    sendMainMenu(chatId, "Привязка успешна! Привет, " + user.getName() + "!");
   }
 
-  private void showMyAds(Long chatId) {
-    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
+  // ─── Главное меню (inline) ────────────────────────────────────────────────
 
-    if (userOpt.isEmpty()) {
-      sendMessage(chatId, "Аккаунт не привязан. Используй /start");
-      return;
+  private void sendMainMenu(Long chatId, String header) {
+    SendMessage msg = SendMessage.builder()
+        .chatId(chatId.toString())
+        .text(header + "\n\nЧто хочешь сделать?")
+        .replyMarkup(buildMenuKeyboard())
+        .build();
+    try { execute(msg); } catch (TelegramApiException e) {
+      log.error("sendMainMenu chatId={}", chatId, e);
     }
-
-    User user = userOpt.get();
-    List<Announcement> userAds = announcementRepository.findByAuthorId(user.getId());
-
-    List<Announcement> activeAds = userAds.stream()
-        .filter(ad -> ad.getStatus() == AdStatus.ACTIVE)
-        .collect(Collectors.toList());
-
-    List<Announcement> moderationAds = userAds.stream()
-        .filter(ad -> ad.getStatus() == AdStatus.UNDER_MODERATION)
-        .collect(Collectors.toList());
-
-    List<Announcement> draftAds = userAds.stream()
-        .filter(ad -> ad.getStatus() == AdStatus.DRAFT)
-        .collect(Collectors.toList());
-
-    StringBuilder response = new StringBuilder("📋 *Твои объявления*\n\n");
-
-    response.append("✅ *Активные:*\n");
-    if (activeAds.isEmpty()) {
-      response.append("Нет активных объявлений\n");
-    } else {
-      for (int i = 0; i < activeAds.size(); i++) {
-        Announcement ad = activeAds.get(i);
-        response.append(i + 1).append(". *").append(escapeMarkdown(ad.getTitle())).append("*\n");
-        response.append("   💰 ").append(ad.getPrice()).append(" ₽\n");
-        response.append("   Обновлено: ").append(formatDate(ad.getUpdatedAt())).append("\n\n");
-      }
-    }
-
-    response.append("⏳ *На модерации:*\n");
-    if (moderationAds.isEmpty()) {
-      response.append("Нет объявлений на модерации\n");
-    } else {
-      for (int i = 0; i < moderationAds.size(); i++) {
-        Announcement ad = moderationAds.get(i);
-        response.append(i + 1).append(". *").append(escapeMarkdown(ad.getTitle())).append("*\n");
-        response.append("   💰 ").append(ad.getPrice()).append(" ₽\n\n");
-      }
-    }
-
-    response.append("\n📝 *Черновики:*\n");
-    if (draftAds.isEmpty()) {
-      response.append("Нет черновиков\n");
-    } else {
-      for (int i = 0; i < draftAds.size(); i++) {
-        Announcement ad = draftAds.get(i);
-        response.append(i + 1).append(". *").append(escapeMarkdown(ad.getTitle())).append("*\n");
-        response.append("   💰 ").append(ad.getPrice()).append(" ₽\n\n");
-      }
-    }
-
-    sendMarkdownMessage(chatId, response.toString());
   }
 
-  private void showMyBookings(Long chatId) {
-    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
+  private InlineKeyboardMarkup buildMenuKeyboard() {
+    return InlineKeyboardMarkup.builder()
+        .keyboard(List.of(
+            List.of(
+                btn("📋 Мои объявления",  CB_MY_ADS),
+                btn("🔒 Бронирования",    CB_BOOKINGS)
+            ),
+            List.of(
+                btn("🔍 Поиск",           CB_SEARCH),
+                btn("🔓 Отвязать аккаунт", CB_UNLINK)
+            )
+        ))
+        .build();
+  }
 
+  // ─── Callbacks ────────────────────────────────────────────────────────────
+
+  private void handleCallback(Update update) {
+    String callbackId = update.getCallbackQuery().getId();
+    String data       = update.getCallbackQuery().getData();
+    Long   chatId     = update.getCallbackQuery().getMessage().getChatId();
+    Integer messageId = update.getCallbackQuery().getMessage().getMessageId();
+
+    answerCallback(callbackId, "");
+
+    if (data == null) return;
+
+    switch (data) {
+      case CB_MENU     -> editToMainMenu(chatId, messageId, "Главное меню");
+      case CB_MY_ADS   -> showMyAds(chatId, messageId);
+      case CB_BOOKINGS -> showMyBookings(chatId, messageId);
+      case CB_SEARCH   -> {
+        waitingForSearch.put(chatId, true);
+        editText(chatId, messageId, "Введи поисковый запрос:", null);
+      }
+      case CB_UNLINK   -> showUnlinkConfirm(chatId, messageId);
+      case CB_UNLINK_YES -> handleUnlinkConfirm(chatId, messageId);
+      case CB_UNLINK_NO  -> editToMainMenu(chatId, messageId, "Отмена. Главное меню:");
+      default -> {
+        if (data.startsWith(CB_CONFIRM_AD)) {
+          handleConfirmAd(chatId, messageId, data.substring(CB_CONFIRM_AD.length()));
+        }
+      }
+    }
+  }
+
+  // ─── Мои объявления ───────────────────────────────────────────────────────
+
+  private void showMyAds(Long chatId, Integer messageId) {
+    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
     if (userOpt.isEmpty()) {
-      sendMessage(chatId, "Аккаунт не привязан. Используй /start");
+      editToMainMenu(chatId, messageId, "Аккаунт не привязан. Используй /start.");
       return;
     }
-
     User user = userOpt.get();
-    List<Booking> allBookings = bookingRepository.findAllByBuyerId(user.getId());
+    List<Announcement> all = announcementRepository.findByAuthorId(user.getId());
 
-    List<Booking> active = allBookings.stream()
+    List<Announcement> active     = filter(all, AdStatus.ACTIVE);
+    List<Announcement> moderation = filter(all, AdStatus.UNDER_MODERATION);
+    List<Announcement> drafts     = filter(all, AdStatus.DRAFT);
+
+    StringBuilder sb = new StringBuilder("📋 *Твои объявления*\n\n");
+
+    sb.append("✅ *Активные:*\n");
+    if (active.isEmpty()) {
+      sb.append("Нет\n");
+    } else {
+      for (int i = 0; i < active.size(); i++) {
+        Announcement ad = active.get(i);
+        sb.append(i + 1).append(". *").append(esc(ad.getTitle())).append("*\n");
+        sb.append("   💰 ").append(ad.getPrice()).append(" ₽  · ").append(formatDate(ad.getUpdatedAt())).append("\n\n");
+      }
+    }
+
+    sb.append("⏳ *На модерации:*\n");
+    if (moderation.isEmpty()) {
+      sb.append("Нет\n");
+    } else {
+      for (int i = 0; i < moderation.size(); i++) {
+        Announcement ad = moderation.get(i);
+        sb.append(i + 1).append(". *").append(esc(ad.getTitle())).append("*\n");
+        sb.append("   💰 ").append(ad.getPrice()).append(" ₽\n\n");
+      }
+    }
+
+    sb.append("📝 *Черновики:*\n");
+    if (drafts.isEmpty()) {
+      sb.append("Нет\n");
+    } else {
+      for (int i = 0; i < drafts.size(); i++) {
+        Announcement ad = drafts.get(i);
+        sb.append(i + 1).append(". *").append(esc(ad.getTitle())).append("*\n");
+        sb.append("   💰 ").append(ad.getPrice()).append(" ₽\n\n");
+      }
+    }
+
+    InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
+        .keyboard(List.of(
+            List.of(btn("🔄 Обновить", CB_MY_ADS), btn("« Меню", CB_MENU))
+        ))
+        .build();
+
+    editText(chatId, messageId, sb.toString(), keyboard, "Markdown");
+  }
+
+  // ─── Мои бронирования ────────────────────────────────────────────────────
+
+  private void showMyBookings(Long chatId, Integer messageId) {
+    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
+    if (userOpt.isEmpty()) {
+      editToMainMenu(chatId, messageId, "Аккаунт не привязан. Используй /start.");
+      return;
+    }
+    User user = userOpt.get();
+    List<Booking> active = bookingRepository.findAllByBuyerId(user.getId()).stream()
         .filter(b -> b.getCancelledAt() == null && b.getConfirmedAt() == null)
         .collect(Collectors.toList());
 
     if (active.isEmpty()) {
-      sendMessage(chatId, "У тебя нет активных бронирований.");
+      editText(chatId, messageId, "У тебя нет активных бронирований.",
+          InlineKeyboardMarkup.builder().keyboard(List.of(List.of(btn("« Меню", CB_MENU)))).build());
       return;
     }
 
-    StringBuilder response = new StringBuilder("🔒 *Мои бронирования*\n\n");
-
+    StringBuilder sb = new StringBuilder("🔒 *Мои бронирования*\n\n");
     Instant now = Instant.now();
     for (int i = 0; i < active.size(); i++) {
-      Booking booking = active.get(i);
-      Optional<Announcement> adOpt = announcementRepository.findById(booking.getAnnouncementId());
+      Booking b = active.get(i);
+      Optional<Announcement> adOpt = announcementRepository.findById(b.getAnnouncementId());
+      String title = adOpt.map(a -> esc(a.getTitle())).orElse("Объявление удалено");
+      String price = adOpt.map(a -> a.getPrice() + " ₽").orElse("—");
 
-      String title = adOpt.map(ad -> escapeMarkdown(ad.getTitle())).orElse("Объявление удалено");
-      String price = adOpt.map(ad -> ad.getPrice() + " ₽").orElse("—");
+      long remaining = 24 * 60 - ChronoUnit.MINUTES.between(b.getCreatedAt(), now);
+      String timeLeft = remaining <= 0 ? "истекает"
+          : remaining < 60 ? "< " + remaining + " мин"
+          : remaining / 60 + " ч " + (remaining % 60 > 0 ? remaining % 60 + " мин" : "");
 
-      long elapsedMinutes = ChronoUnit.MINUTES.between(booking.getCreatedAt(), now);
-      long remainingMinutes = 24 * 60 - elapsedMinutes;
-
-      String remaining;
-      if (remainingMinutes <= 0) {
-        remaining = "истекает";
-      } else if (remainingMinutes < 60) {
-        remaining = "< " + remainingMinutes + " мин";
-      } else {
-        long hours = remainingMinutes / 60;
-        long minutes = remainingMinutes % 60;
-        remaining = hours + " ч " + (minutes > 0 ? minutes + " мин" : "");
-      }
-
-      response.append(i + 1).append(". *").append(title).append("*\n");
-      response.append("   💰 ").append(price).append("\n");
-      response.append("   ⏳ Осталось: ").append(remaining).append("\n\n");
+      sb.append(i + 1).append(". *").append(title).append("*\n");
+      sb.append("   💰 ").append(price).append("  ⏳ ").append(timeLeft).append("\n\n");
     }
-
-    sendMarkdownMessage(chatId, response.toString());
-  }
-
-  private void unlinkCommand(Long chatId) {
-    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
-
-    if (userOpt.isEmpty()) {
-      sendMessage(chatId, "Аккаунт не привязан. Используй /start для привязки.");
-      return;
-    }
-
-    User user = userOpt.get();
-
-    InlineKeyboardButton confirmButton = InlineKeyboardButton.builder()
-        .text("Да, отвязать")
-        .callbackData(CALLBACK_UNLINK_CONFIRM)
-        .build();
-
-    InlineKeyboardButton cancelButton = InlineKeyboardButton.builder()
-        .text("Отмена")
-        .callbackData(CALLBACK_UNLINK_CANCEL)
-        .build();
 
     InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
-        .keyboard(List.of(List.of(confirmButton, cancelButton)))
+        .keyboard(List.of(
+            List.of(btn("🔄 Обновить", CB_BOOKINGS), btn("« Меню", CB_MENU))
+        ))
         .build();
 
-    SendMessage message = SendMessage.builder()
-        .chatId(chatId.toString())
-        .text("Отвязать аккаунт " + user.getEmail() + " от этого Telegram?\n\nПосле отвязки уведомления приходить не будут.")
-        .replyMarkup(keyboard)
-        .build();
-
-    try {
-      execute(message);
-    } catch (TelegramApiException e) {
-      log.error("Ошибка отправки запроса на отвязку chatId={}", chatId, e);
-    }
+    editText(chatId, messageId, sb.toString(), keyboard, "Markdown");
   }
+
+  // ─── Поиск ───────────────────────────────────────────────────────────────
 
   private void performSearch(Long chatId, String query) {
     AnnouncementFilterDto filter = new AnnouncementFilterDto();
     filter.setText(query);
-
     List<Announcement> results = announcementRepository.searchApproved(filter, "createdAt", "DESC");
 
     if (results.isEmpty()) {
@@ -316,399 +316,315 @@ public class TelegramBot extends TelegramLongPollingBot {
     }
 
     int shown = Math.min(results.size(), 5);
-    StringBuilder response = new StringBuilder("🔍 *Результаты: " + escapeMarkdown(query) + "*\n");
-    if (results.size() > shown) {
-      response.append("Найдено: ").append(results.size()).append(", показываю первые ").append(shown).append("\n");
-    }
-    response.append("\n");
+    StringBuilder sb = new StringBuilder("<b>🔍 " + escHtml(query) + "</b>");
+    if (results.size() > shown)
+      sb.append(" (показываю ").append(shown).append(" из ").append(results.size()).append(")");
+    sb.append("\n\n");
 
     for (int i = 0; i < shown; i++) {
       Announcement ad = results.get(i);
-      response.append(i + 1).append(". *").append(escapeMarkdown(ad.getTitle())).append("*\n");
-      response.append("   💰 ").append(ad.getPrice()).append(" ₽");
-      if (ad.getCondition() != null) {
-        response.append(" · ").append(ad.getCondition().getDisplayName());
-      }
-      response.append("\n");
-      if (ad.getCategory() != null) {
-        response.append("   🏷 ").append(ad.getCategory().getDisplayName()).append("\n");
-      }
-      if (ad.getLocation() != null && !ad.getLocation().isBlank()) {
-        response.append("   📍 ").append(escapeMarkdown(ad.getLocation())).append("\n");
-      }
-      response.append("\n");
+      sb.append(i + 1).append(". <a href=\"").append(frontendUrl).append("/ad/").append(ad.getId()).append("\">")
+          .append(escHtml(ad.getTitle())).append("</a>\n");
+      sb.append("   💰 ").append(ad.getPrice()).append(" ₽");
+      if (ad.getCondition() != null) sb.append(" · ").append(ad.getCondition().getDisplayName());
+      sb.append("\n");
+      if (ad.getCategory() != null)
+        sb.append("   🏷 ").append(ad.getCategory().getDisplayName()).append("\n");
+      if (ad.getLocation() != null && !ad.getLocation().isBlank())
+        sb.append("   📍 ").append(escHtml(ad.getLocation())).append("\n");
+      sb.append("\n");
     }
 
-    sendMarkdownMessage(chatId, response.toString());
+    InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
+        .keyboard(List.of(
+            List.of(btn("🔍 Новый поиск", CB_SEARCH), btn("« Меню", CB_MENU))
+        ))
+        .build();
+
+    SendMessage msg = SendMessage.builder()
+        .chatId(chatId.toString())
+        .text(sb.toString())
+        .parseMode("HTML")
+        .replyMarkup(keyboard)
+        .build();
+    try { execute(msg); } catch (TelegramApiException e) {
+      log.error("performSearch chatId={}", chatId, e);
+    }
   }
 
-  // Вызывается из планировщика — уведомляет о новых бронированиях
+  // ─── Отвязка аккаунта ────────────────────────────────────────────────────
+
+  private void showUnlinkConfirm(Long chatId, Integer messageId) {
+    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
+    if (userOpt.isEmpty()) {
+      editToMainMenu(chatId, messageId, "Аккаунт не привязан.");
+      return;
+    }
+    User user = userOpt.get();
+    InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
+        .keyboard(List.of(List.of(
+            btn("✅ Да, отвязать", CB_UNLINK_YES),
+            btn("❌ Отмена",       CB_UNLINK_NO)
+        )))
+        .build();
+    editText(chatId, messageId,
+        "Отвязать аккаунт *" + esc(user.getEmail()) + "*?\nУведомления перестанут приходить.",
+        keyboard, "Markdown");
+  }
+
+  private void handleUnlinkConfirm(Long chatId, Integer messageId) {
+    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
+    if (userOpt.isEmpty()) {
+      editToMainMenu(chatId, messageId, "Аккаунт уже не привязан.");
+      return;
+    }
+    User user = userOpt.get();
+    String email = user.getEmail();
+    user.setTelegramChatId(null);
+    user.setTelegramUsername(null);
+    userRepository.save(user);
+    log.info("Аккаунт userId={} отвязан от chatId={}", user.getId(), chatId);
+
+    SendMessage msg = SendMessage.builder()
+        .chatId(chatId.toString())
+        .text("Аккаунт *" + esc(email) + "* отвязан. Используй /start для повторной привязки.")
+        .parseMode("Markdown")
+        .replyMarkup(ReplyKeyboardRemove.builder().removeKeyboard(true).build())
+        .build();
+    try { execute(msg); } catch (TelegramApiException e) {
+      log.error("handleUnlinkConfirm chatId={}", chatId, e);
+    }
+  }
+
+  // ─── Подтверждение актуальности объявления ────────────────────────────────
+
+  private void handleConfirmAd(Long chatId, Integer messageId, String adIdStr) {
+    long adId;
+    try { adId = Long.parseLong(adIdStr); }
+    catch (NumberFormatException e) { return; }
+
+    Optional<Announcement> adOpt = announcementRepository.findById(adId);
+    if (adOpt.isEmpty()) {
+      editText(chatId, messageId, "Объявление не найдено.", null);
+      return;
+    }
+    Announcement ad = adOpt.get();
+    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
+    if (userOpt.isEmpty() || !userOpt.get().getId().equals(ad.getAuthorId())) {
+      editText(chatId, messageId, "Нет доступа.", null);
+      return;
+    }
+    ad.setUpdatedAt(Instant.now());
+    ad.setNotifiedAt(null);
+    announcementRepository.save(ad);
+    editText(chatId, messageId, "✅ Объявление «" + ad.getTitle() + "» подтверждено!", null);
+    log.info("Объявление id={} подтверждено chatId={}", adId, chatId);
+  }
+
+  // ─── Планировщик: уведомления ────────────────────────────────────────────
+
   public void notifyNewBookings() {
     List<Booking> pending = bookingRepository.findByNotificationSentAtIsNull();
     for (Booking booking : pending) {
       announcementRepository.findById(booking.getAnnouncementId()).ifPresent(ad -> {
         Optional<User> sellerOpt = userRepository.findById(ad.getAuthorId());
-        Optional<User> buyerOpt = userRepository.findById(booking.getBuyerId());
+        Optional<User> buyerOpt  = userRepository.findById(booking.getBuyerId());
+        String sellerContact = sellerOpt.map(this::tgContact).orElse("продавец");
+        String buyerContact  = buyerOpt.map(this::tgContact).orElse("покупатель");
 
-        String sellerContact = sellerOpt.map(this::getTelegramContact).orElse("продавец");
-        String buyerContact = buyerOpt.map(this::getTelegramContact).orElse("покупатель");
-
-        sellerOpt.ifPresent(seller -> {
-          if (seller.getTelegramChatId() != null) {
-            sendMessage(seller.getTelegramChatId(),
-                "🔒 Твой товар «" + ad.getTitle() + "» забронирован на 24 часа!\n" +
-                "Покупатель: " + buyerContact + "\n" +
-                "Свяжитесь для организации передачи.");
-          }
-        });
-
-        buyerOpt.ifPresent(buyer -> {
-          if (buyer.getTelegramChatId() != null) {
-            sendMessage(buyer.getTelegramChatId(),
-                "🔒 Ты забронировал «" + ad.getTitle() + "» за " + ad.getPrice() + " ₽ на 24 часа.\n" +
-                "Продавец: " + sellerContact + "\n" +
-                "Свяжись с продавцом для организации передачи.");
-          }
-        });
+        sellerOpt.filter(u -> u.getTelegramChatId() != null).ifPresent(u ->
+            sendMessage(u.getTelegramChatId(),
+                "🔒 Твой товар «" + ad.getTitle() + "» забронирован на 24 ч!\nПокупатель: " + buyerContact));
+        buyerOpt.filter(u -> u.getTelegramChatId() != null).ifPresent(u ->
+            sendMessage(u.getTelegramChatId(),
+                "🔒 Ты забронировал «" + ad.getTitle() + "» за " + ad.getPrice() + " ₽ на 24 ч.\nПродавец: " + sellerContact));
       });
       booking.setNotificationSentAt(Instant.now());
       bookingRepository.save(booking);
-      log.info("Уведомление о бронировании отправлено для bookingId={}", booking.getId());
+      log.info("Уведомление о бронировании bookingId={}", booking.getId());
     }
   }
 
-  // Вызывается из планировщика — уведомляет об отменённых бронированиях
   public void notifyCancelledBookings() {
     List<Booking> cancelled = bookingRepository.findByCancelledAtIsNotNullAndCancelNotificationSentAtIsNull();
     for (Booking booking : cancelled) {
-      Optional<Announcement> adOpt = announcementRepository.findById(booking.getAnnouncementId());
-      Optional<User> sellerOpt = adOpt.flatMap(ad -> userRepository.findById(ad.getAuthorId()));
-      Optional<User> buyerOpt = userRepository.findById(booking.getBuyerId());
+      Optional<Announcement> adOpt    = announcementRepository.findById(booking.getAnnouncementId());
+      Optional<User>         sellerOpt = adOpt.flatMap(ad -> userRepository.findById(ad.getAuthorId()));
+      Optional<User>         buyerOpt  = userRepository.findById(booking.getBuyerId());
+      String adTitle       = adOpt.map(Announcement::getTitle).orElse("товар");
+      String sellerContact = sellerOpt.map(this::tgContact).orElse("продавец");
+      String buyerContact  = buyerOpt.map(this::tgContact).orElse("покупатель");
 
-      String adTitle = adOpt.map(Announcement::getTitle).orElse("товар");
-      String sellerContact = sellerOpt.map(this::getTelegramContact).orElse("продавец");
-      String buyerContact = buyerOpt.map(this::getTelegramContact).orElse("покупатель");
-
-      sellerOpt.ifPresent(seller -> {
-        if (seller.getTelegramChatId() != null) {
-          sendMessage(seller.getTelegramChatId(),
-              "❌ Бронь на твой товар «" + adTitle + "» отменена.\n" +
-              "Покупатель: " + buyerContact + "\n" +
-              "Товар снова доступен для покупки.");
-        }
-      });
-
-      buyerOpt.ifPresent(buyer -> {
-        if (buyer.getTelegramChatId() != null) {
-          sendMessage(buyer.getTelegramChatId(),
-              "❌ Твоя бронь на «" + adTitle + "» отменена.\n" +
-              "Продавец: " + sellerContact);
-        }
-      });
+      sellerOpt.filter(u -> u.getTelegramChatId() != null).ifPresent(u ->
+          sendMessage(u.getTelegramChatId(),
+              "❌ Бронь на «" + adTitle + "» отменена.\nПокупатель: " + buyerContact + "\nТовар снова доступен."));
+      buyerOpt.filter(u -> u.getTelegramChatId() != null).ifPresent(u ->
+          sendMessage(u.getTelegramChatId(),
+              "❌ Твоя бронь на «" + adTitle + "» отменена.\nПродавец: " + sellerContact));
 
       booking.setCancelNotificationSentAt(Instant.now());
       bookingRepository.save(booking);
-      log.info("Уведомление об отмене брони отправлено для bookingId={}", booking.getId());
+      log.info("Уведомление об отмене брони bookingId={}", booking.getId());
     }
   }
 
-  // Вызывается из планировщика — уведомляет о подтверждённых покупках
   public void notifyConfirmedBookings() {
     List<Booking> confirmed = bookingRepository.findByConfirmedAtIsNotNullAndConfirmNotificationSentAtIsNull();
     for (Booking booking : confirmed) {
       announcementRepository.findById(booking.getAnnouncementId()).ifPresent(ad -> {
         Optional<User> sellerOpt = userRepository.findById(ad.getAuthorId());
-        Optional<User> buyerOpt = userRepository.findById(booking.getBuyerId());
+        Optional<User> buyerOpt  = userRepository.findById(booking.getBuyerId());
+        String sellerContact = sellerOpt.map(this::tgContact).orElse("продавец");
+        String buyerContact  = buyerOpt.map(this::tgContact).orElse("покупатель");
 
-        String sellerContact = sellerOpt.map(this::getTelegramContact).orElse("продавец");
-        String buyerContact = buyerOpt.map(this::getTelegramContact).orElse("покупатель");
-
-        sellerOpt.ifPresent(seller -> {
-          if (seller.getTelegramChatId() != null) {
-            sendMessage(seller.getTelegramChatId(),
-                "🎉 Продажа «" + ad.getTitle() + "» за " + ad.getPrice() + " ₽ подтверждена!\n" +
-                "Покупатель: " + buyerContact);
-          }
-        });
-
-        buyerOpt.ifPresent(buyer -> {
-          if (buyer.getTelegramChatId() != null) {
-            sendMessage(buyer.getTelegramChatId(),
-                "🎉 Покупка «" + ad.getTitle() + "» за " + ad.getPrice() + " ₽ подтверждена!\n" +
-                "Продавец: " + sellerContact);
-          }
-        });
+        sellerOpt.filter(u -> u.getTelegramChatId() != null).ifPresent(u ->
+            sendMessage(u.getTelegramChatId(),
+                "🎉 Продажа «" + ad.getTitle() + "» за " + ad.getPrice() + " ₽ подтверждена!\nПокупатель: " + buyerContact));
+        buyerOpt.filter(u -> u.getTelegramChatId() != null).ifPresent(u ->
+            sendMessage(u.getTelegramChatId(),
+                "🎉 Покупка «" + ad.getTitle() + "» за " + ad.getPrice() + " ₽ подтверждена!\nПродавец: " + sellerContact));
       });
       booking.setConfirmNotificationSentAt(Instant.now());
       bookingRepository.save(booking);
-      log.info("Уведомление о подтверждении покупки отправлено для bookingId={}", booking.getId());
+      log.info("Уведомление о подтверждении bookingId={}", booking.getId());
     }
   }
 
-  // Вызывается из планировщика — проверяет объявления, не обновлявшиеся 30 дней
   public void checkAndNotifyOldAnnouncements() {
     archiveUnconfirmed();
     notifyStaleAds();
   }
 
-  // Шаг 1: архивируем объявления, по которым уведомление отправлено, но подтверждение не пришло
   private void archiveUnconfirmed() {
     Instant oneDayAgo = Instant.now().minus(1, ChronoUnit.DAYS);
+    List<Announcement> unconfirmed = announcementRepository.findByStatusAndNotifiedAtBefore(AdStatus.ACTIVE, oneDayAgo);
+    Map<Long, List<Announcement>> byUser = unconfirmed.stream().collect(Collectors.groupingBy(Announcement::getAuthorId));
 
-    List<Announcement> unconfirmed = announcementRepository.findByStatusAndNotifiedAtBefore(
-        AdStatus.ACTIVE, oneDayAgo);
-
-    Map<Long, List<Announcement>> adsByUser = unconfirmed.stream()
-        .collect(Collectors.groupingBy(Announcement::getAuthorId));
-
-    for (Map.Entry<Long, List<Announcement>> entry : adsByUser.entrySet()) {
-      List<Announcement> ads = entry.getValue();
-
-      for (Announcement ad : ads) {
+    for (Map.Entry<Long, List<Announcement>> entry : byUser.entrySet()) {
+      entry.getValue().forEach(ad -> {
         ad.setStatus(AdStatus.ARCHIVED);
         ad.setNotifiedAt(null);
         announcementRepository.save(ad);
-        log.info("Объявление id={} переведено в архив (не подтверждено)", ad.getId());
-      }
-
-      userRepository.findById(entry.getKey()).ifPresent(user -> {
-        if (user.getTelegramChatId() != null) {
-          sendArchivedNotification(user.getTelegramChatId(), ads);
-        }
+        log.info("Объявление id={} в архив", ad.getId());
       });
+      userRepository.findById(entry.getKey())
+          .filter(u -> u.getTelegramChatId() != null)
+          .ifPresent(u -> sendArchivedNotification(u.getTelegramChatId(), entry.getValue()));
     }
   }
 
-  // Шаг 2: отправляем уведомления по объявлениям, которые не обновлялись 30 дней и ещё не уведомлены
   private void notifyStaleAds() {
     Instant thirtyDaysAgo = Instant.now().minus(30, ChronoUnit.DAYS);
+    List<Announcement> stale = announcementRepository.findByStatusAndUpdatedAtBefore(AdStatus.ACTIVE, thirtyDaysAgo)
+        .stream().filter(ad -> ad.getNotifiedAt() == null).collect(Collectors.toList());
 
-    List<Announcement> staleAds = announcementRepository.findByStatusAndUpdatedAtBefore(
-        AdStatus.ACTIVE, thirtyDaysAgo).stream()
-        .filter(ad -> ad.getNotifiedAt() == null)
-        .collect(Collectors.toList());
-
-    Map<Long, List<Announcement>> adsByUser = staleAds.stream()
-        .collect(Collectors.groupingBy(Announcement::getAuthorId));
-
-    for (Map.Entry<Long, List<Announcement>> entry : adsByUser.entrySet()) {
-      Long userId = entry.getKey();
-      List<Announcement> userAds = entry.getValue();
-
-      for (Announcement ad : userAds) {
-        ad.setNotifiedAt(Instant.now());
-        announcementRepository.save(ad);
-      }
-
-      userRepository.findById(userId).ifPresent(user -> {
-        if (user.getTelegramChatId() != null) {
-          sendRenewalRequest(user.getTelegramChatId(), userAds);
-        }
-      });
+    Map<Long, List<Announcement>> byUser = stale.stream().collect(Collectors.groupingBy(Announcement::getAuthorId));
+    for (Map.Entry<Long, List<Announcement>> entry : byUser.entrySet()) {
+      entry.getValue().forEach(ad -> { ad.setNotifiedAt(Instant.now()); announcementRepository.save(ad); });
+      userRepository.findById(entry.getKey())
+          .filter(u -> u.getTelegramChatId() != null)
+          .ifPresent(u -> entry.getValue().forEach(ad -> sendRenewalNotification(u.getTelegramChatId(), ad)));
     }
   }
 
   private void sendArchivedNotification(Long chatId, List<Announcement> ads) {
     StringBuilder text = new StringBuilder("📦 Объявления переведены в архив:\n\n");
-    for (Announcement ad : ads) {
-      text.append("• ").append(ad.getTitle()).append(" — ").append(ad.getPrice()).append(" ₽\n");
-    }
-    text.append("\nЕсли хочешь восстановить — сделай это на портале.");
+    ads.forEach(ad -> text.append("• ").append(ad.getTitle()).append(" — ").append(ad.getPrice()).append(" ₽\n"));
+    text.append("\nВосстановить можно на портале.");
     sendMessage(chatId, text.toString());
   }
 
-  private void sendRenewalRequest(Long chatId, List<Announcement> ads) {
-    for (Announcement ad : ads) {
-      sendSingleRenewalNotification(chatId, ad);
-    }
-  }
-
-  private void sendSingleRenewalNotification(Long chatId, Announcement ad) {
-    String text = "⚠️ *Объявление уходит в архив\\!*\n\n" +
-        escapeMarkdownV2(ad.getTitle()) + "\n" +
-        "💰 " + ad.getPrice() + " ₽\n" +
-        "🕐 Не обновлялось более 30 дней\n\n" +
-        "Подтверди, что оно ещё актуально, иначе уйдёт в архив\\.";
-
-    InlineKeyboardButton button = InlineKeyboardButton.builder()
-        .text("✅ Всё ещё актуально")
-        .callbackData(CALLBACK_CONFIRM_AD + ad.getId())
-        .build();
+  private void sendRenewalNotification(Long chatId, Announcement ad) {
+    String text = "⚠️ *Объявление уходит в архив\\!*\n\n"
+        + escV2(ad.getTitle()) + "\n💰 " + ad.getPrice() + " ₽\n"
+        + "🕐 Не обновлялось более 30 дней\n\nПодтверди актуальность\\.";
 
     InlineKeyboardMarkup keyboard = InlineKeyboardMarkup.builder()
-        .keyboard(List.of(List.of(button)))
+        .keyboard(List.of(List.of(btn("✅ Всё ещё актуально", CB_CONFIRM_AD + ad.getId()))))
         .build();
 
-    SendMessage message = SendMessage.builder()
+    SendMessage msg = SendMessage.builder()
         .chatId(chatId.toString())
         .text(text)
         .parseMode("MarkdownV2")
         .replyMarkup(keyboard)
         .build();
-
-    try {
-      execute(message);
-    } catch (TelegramApiException e) {
-      log.error("Ошибка отправки уведомления для объявления id={} chatId={}", ad.getId(), chatId, e);
+    try { execute(msg); } catch (TelegramApiException e) {
+      log.error("sendRenewalNotification adId={} chatId={}", ad.getId(), chatId, e);
     }
   }
 
-  private void handleCallbackQuery(Update update) {
-    String callbackId = update.getCallbackQuery().getId();
-    String data = update.getCallbackQuery().getData();
-    Long chatId = update.getCallbackQuery().getMessage().getChatId();
-    Integer messageId = update.getCallbackQuery().getMessage().getMessageId();
+  // ─── Утилиты: отправка/редактирование ────────────────────────────────────
 
-    if (data != null && data.startsWith(CALLBACK_CONFIRM_AD)) {
-      String adIdStr = data.substring(CALLBACK_CONFIRM_AD.length());
-      handleConfirmAd(callbackId, chatId, messageId, adIdStr);
-    } else if (CALLBACK_UNLINK_CONFIRM.equals(data)) {
-      handleUnlinkConfirm(callbackId, chatId, messageId);
-    } else if (CALLBACK_UNLINK_CANCEL.equals(data)) {
-      handleUnlinkCancel(callbackId, chatId, messageId);
-    }
+  private void editToMainMenu(Long chatId, Integer messageId, String header) {
+    editText(chatId, messageId, header + "\n\nЧто хочешь сделать?", buildMenuKeyboard());
   }
 
-  private void handleConfirmAd(String callbackId, Long chatId, Integer messageId, String adIdStr) {
-    long adId;
-    try {
-      adId = Long.parseLong(adIdStr);
-    } catch (NumberFormatException e) {
-      answerCallback(callbackId, "Ошибка: некорректный ID объявления");
-      return;
-    }
-
-    Optional<Announcement> adOpt = announcementRepository.findById(adId);
-    if (adOpt.isEmpty()) {
-      answerCallback(callbackId, "Объявление не найдено");
-      return;
-    }
-
-    Announcement ad = adOpt.get();
-
-    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
-    if (userOpt.isEmpty() || !userOpt.get().getId().equals(ad.getAuthorId())) {
-      answerCallback(callbackId, "Нет доступа к этому объявлению");
-      return;
-    }
-
-    ad.setUpdatedAt(Instant.now());
-    ad.setNotifiedAt(null);
-    announcementRepository.save(ad);
-
-    removeButtonFromMessage(chatId, messageId, adId);
-
-    answerCallback(callbackId, "✅ Объявление «" + truncate(ad.getTitle(), 40) + "» подтверждено!");
-    log.info("Объявление id={} подтверждено пользователем chatId={}", adId, chatId);
+  private void editText(Long chatId, Integer messageId, String text, InlineKeyboardMarkup keyboard) {
+    editText(chatId, messageId, text, keyboard, null);
   }
 
-  private void handleUnlinkConfirm(String callbackId, Long chatId, Integer messageId) {
-    Optional<User> userOpt = userRepository.findByTelegramChatId(chatId);
-
-    if (userOpt.isEmpty()) {
-      answerCallback(callbackId, "Аккаунт уже не привязан");
-      removeButtonFromMessage(chatId, messageId, null);
-      return;
-    }
-
-    User user = userOpt.get();
-    user.setTelegramChatId(null);
-    user.setTelegramUsername(null);
-    userRepository.save(user);
-
-    removeButtonFromMessage(chatId, messageId, null);
-    answerCallback(callbackId, "Аккаунт отвязан");
-    sendMessage(chatId, "Аккаунт " + user.getEmail() + " отвязан. Используй /start для повторной привязки.");
-    log.info("Аккаунт userId={} отвязан от chatId={}", user.getId(), chatId);
-  }
-
-  private void handleUnlinkCancel(String callbackId, Long chatId, Integer messageId) {
-    removeButtonFromMessage(chatId, messageId, null);
-    answerCallback(callbackId, "Отменено");
-  }
-
-  private void answerCallback(String callbackId, String text) {
-    AnswerCallbackQuery answer = AnswerCallbackQuery.builder()
-        .callbackQueryId(callbackId)
+  private void editText(Long chatId, Integer messageId, String text, InlineKeyboardMarkup keyboard, String parseMode) {
+    EditMessageText edit = EditMessageText.builder()
+        .chatId(chatId.toString())
+        .messageId(messageId)
         .text(text)
-        .showAlert(false)
+        .replyMarkup(keyboard)
         .build();
-    try {
-      execute(answer);
-    } catch (TelegramApiException e) {
-      log.error("Ошибка ответа на callback: {}", callbackId, e);
+    if (parseMode != null) edit.setParseMode(parseMode);
+    try { execute(edit); } catch (TelegramApiException e) {
+      log.error("editText chatId={} messageId={}", chatId, messageId, e);
     }
-  }
-
-  private void removeButtonFromMessage(Long chatId, Integer messageId, Object context) {
-    try {
-      EditMessageReplyMarkup edit = EditMessageReplyMarkup.builder()
-          .chatId(chatId.toString())
-          .messageId(messageId)
-          .replyMarkup(InlineKeyboardMarkup.builder().keyboard(Collections.emptyList()).build())
-          .build();
-      execute(edit);
-    } catch (TelegramApiException e) {
-      log.warn("Не удалось обновить клавиатуру сообщения context={}: {}", context, e.getMessage());
-    }
-  }
-
-  private String getTelegramContact(User user) {
-    StringBuilder contact = new StringBuilder();
-    if (user.getTelegramUsername() != null && !user.getTelegramUsername().isBlank()) {
-      contact.append("@").append(user.getTelegramUsername());
-    } else {
-      contact.append(user.getName());
-    }
-    if (user.getEmail() != null && !user.getEmail().isBlank()) {
-      contact.append(" (").append(user.getEmail()).append(")");
-    }
-    return contact.toString();
   }
 
   private void sendMessage(Long chatId, String text) {
-    SendMessage message = SendMessage.builder()
-        .chatId(chatId.toString())
-        .text(text)
-        .build();
-    try {
-      execute(message);
-    } catch (TelegramApiException e) {
-      log.error("Ошибка отправки сообщения chatId: {}", chatId, e);
+    SendMessage msg = SendMessage.builder().chatId(chatId.toString()).text(text).build();
+    try { execute(msg); } catch (TelegramApiException e) {
+      log.error("sendMessage chatId={}", chatId, e);
     }
   }
 
-  private void sendMarkdownMessage(Long chatId, String text) {
-    SendMessage message = SendMessage.builder()
-        .chatId(chatId.toString())
-        .text(text)
-        .parseMode("Markdown")
-        .build();
+  private void answerCallback(String id, String text) {
     try {
-      execute(message);
+      execute(AnswerCallbackQuery.builder().callbackQueryId(id).text(text).showAlert(false).build());
     } catch (TelegramApiException e) {
-      log.error("Ошибка отправки markdown-сообщения chatId: {}", chatId, e);
+      log.error("answerCallback id={}", id, e);
     }
+  }
+
+  private static InlineKeyboardButton btn(String text, String data) {
+    return InlineKeyboardButton.builder().text(text).callbackData(data).build();
+  }
+
+  // ─── Утилиты: текст ───────────────────────────────────────────────────────
+
+  private String tgContact(User user) {
+    String name = user.getTelegramUsername() != null ? "@" + user.getTelegramUsername() : user.getName();
+    return user.getEmail() != null ? name + " (" + user.getEmail() + ")" : name;
   }
 
   private String formatDate(Instant instant) {
-    if (instant == null) return "неизвестно";
+    if (instant == null) return "—";
     return java.time.format.DateTimeFormatter.ofPattern("dd.MM.yyyy")
         .format(java.time.LocalDateTime.ofInstant(instant, java.time.ZoneId.systemDefault()));
   }
 
-  private String escapeMarkdown(String text) {
+  private List<Announcement> filter(List<Announcement> list, AdStatus status) {
+    return list.stream().filter(a -> a.getStatus() == status).collect(Collectors.toList());
+  }
+
+  private String esc(String text) {
     if (text == null) return "";
     return text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`");
   }
 
-  private String escapeMarkdownV2(String text) {
+  private String escV2(String text) {
     if (text == null) return "";
     return text.replaceAll("([_*\\[\\]()~`>#+\\-=|{}.!\\\\])", "\\\\$1");
   }
 
-  private String truncate(String text, int maxLen) {
+  private String escHtml(String text) {
     if (text == null) return "";
-    return text.length() <= maxLen ? text : text.substring(0, maxLen - 1) + "…";
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
   }
 }
